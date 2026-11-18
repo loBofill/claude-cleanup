@@ -234,10 +234,12 @@ struct ContentView: View {
                 Spacer()
                 Button("Ara no") { finish(nil) }
                     .keyboardShortcut(.cancelAction)
+                // Mouse only (no Return, no Tab focus): the window opens on its own and may take focus while you type.
                 Button(selected.isEmpty ? "Tanca" : "Tanca \(selected.count)") {
                     finish(selected.map(\.pid))
                 }
-                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .focusable(false)
                 .disabled(selected.isEmpty)
             }
             .padding(16)
@@ -269,5 +271,7 @@ window.delegate = delegate
 window.contentView = NSHostingView(rootView: ContentView(store: store))
 window.center()
 window.makeKeyAndOrderFront(nil)
+// Under launchd, macOS 14+ may refuse activation; still put the window in front.
+window.orderFrontRegardless()
 app.activate(ignoringOtherApps: true)
 app.run()
