@@ -41,7 +41,7 @@ func finish(_ pids: [Int]?) -> Never {
 }
 
 func idleText(_ hours: Int) -> String {
-    hours >= 48 ? "inactiva \(hours / 24) dies" : "inactiva \(hours) h"
+    "inactiva \(hours) h"
 }
 
 func memText(_ mb: Int) -> String {
@@ -185,7 +185,7 @@ struct ContentView: View {
                     .keyboardShortcut("r", modifiers: .command)
                     .help("Torna a llegir quines sessions estan inactives (⌘R)")
                 }
-                Text("Fa més de \(input.idleThreshold) h que no fan res. Desmarca les que vulguis mantenir. Les que tanquis es poden reprendre amb claude --resume, i el recap queda escrit al seu terminal.")
+                Text("Porten \(input.idleThreshold) h o més sense fer res, comptant només quan el Mac està despert. Desmarca les que vulguis mantenir. Les que tanquis es poden reprendre amb claude --resume, i el recap queda escrit al seu terminal.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

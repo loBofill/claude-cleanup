@@ -50,7 +50,7 @@ Sessions you leave open are snoozed for an hour, so the scheduled run doesn't as
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CLAUDE_CLEANUP_IDLE_HOURS` | `12` | How long a session must be idle before it's offered. |
+| `CLAUDE_CLEANUP_IDLE_HOURS` | `4` | How long a session must be idle, counting only time the Mac was awake, before it's offered. |
 | `CLAUDE_CLEANUP_SNOOZE_HOURS` | `1` | How long a session you chose to keep is left alone. |
 
 Set them when you run `--install` and they're saved into the launchd job:
@@ -62,6 +62,8 @@ CLAUDE_CLEANUP_IDLE_HOURS=6 claude-cleanup --install
 ## How it works
 
 Every running Claude Code session keeps a small status file in `~/.claude/sessions/<pid>.json`. It holds the session ID, its folder, its status (`idle`, `busy`, …) and when that status last changed. A session counts as idle when its status is `idle` and hasn't changed for the threshold.
+
+The threshold only counts time the Mac was awake, so a night the Mac spent asleep doesn't count toward it. If something kept the Mac awake overnight, such as a running `caffeinate`, those hours do count. Sleep periods come from the power log (`pmset -g log`), which keeps about a week of history. Time before that isn't counted. If the power log can't be read, plain clock time is used instead.
 
 The title and recap come from the session's transcript in `~/.claude/projects/`. The title is the one you set with `/rename`, or else Claude's own title. The recap is the summary Claude writes when you step away from a session. If there's no recap, the picker shows your last message instead.
 

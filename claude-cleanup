@@ -13,7 +13,9 @@
 #   claude-cleanup --install    run --run every 10 minutes via launchd
 #   claude-cleanup --uninstall  remove the launchd job
 #
-# Env: CLAUDE_CLEANUP_IDLE_HOURS (default 12), CLAUDE_CLEANUP_SNOOZE_HOURS (default 1)
+# Env: CLAUDE_CLEANUP_IDLE_HOURS (default 4), CLAUDE_CLEANUP_SNOOZE_HOURS (default 1)
+#
+# Idle time only counts while the Mac is awake: sleep periods come from `pmset -g log`.
 #
 # Data sources:
 #   ~/.claude/sessions/<pid>.json        pid, status, statusUpdatedAt, procStart, startedAt, sessionId,
@@ -25,7 +27,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # launchd starts jobs in the C locale, where cut/fold would split accented characters.
 export LC_CTYPE="${LC_CTYPE:-en_US.UTF-8}"
 
-IDLE_HOURS="${CLAUDE_CLEANUP_IDLE_HOURS:-12}"
+IDLE_HOURS="${CLAUDE_CLEANUP_IDLE_HOURS:-4}"
 SNOOZE_HOURS="${CLAUDE_CLEANUP_SNOOZE_HOURS:-1}"
 case "$IDLE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_IDLE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
 case "$SNOOZE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_SNOOZE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
@@ -95,6 +97,27 @@ snooze() {
   mv "$tmp" "$SNOOZE_FILE"
 }
 
+# Sets SLEEP_PERIODS to the Mac's sleep periods as "start end" epoch lines (end -1 = still
+# asleep), from the power log (about a week of history). Time before the log starts is
+# one sleep period, so it never counts as idle. Kept in memory, not in a shared file,
+# so concurrent runs (the picker's refresh, launchd) can't read a half-written list.
+load_sleep_periods() {
+  SLEEP_PERIODS=$(pmset -g log 2>/dev/null | perl -MTime::Local -ne '
+    next unless /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) ([+-])(\d\d)(\d\d) (Sleep|Wake) {2,}/;
+    my $t = timegm($6, $5, $4, $3, $2 - 1, $1) - ($7 eq "-" ? -1 : 1) * ($8 * 3600 + $9 * 60);
+    $first //= $t;
+    if ($10 eq "Sleep") { $since //= $t } elsif (defined $since) { print "$since $t\n"; undef $since }
+    END { print "0 $first\n" if defined $first; print "$since -1\n" if defined $since }')
+  [ -n "$SLEEP_PERIODS" ] || log "power log unreadable: idle time falls back to clock time"
+}
+
+# Whole hours the Mac was awake since a timestamp in ms. Without a power log, wall-clock hours.
+awake_hours() {
+  printf '%s\n' "${SLEEP_PERIODS:-}" | awk -v s="$(( $1 / 1000 ))" -v n="$(date +%s)" '
+    NF == 2 { a = $1; b = ($2 < 0 ? n : $2); if (a < s) a = s; if (b > n) b = n; if (b > a) slept += b - a }
+    END { t = n - s - slept; if (t < 0) t = 0; print int(t / 3600) }'
+}
+
 # Latest entry of a given kind in a transcript, read from the end of the file.
 # $1 file, $2 grep pattern, $3 jq filter that selects and extracts the value.
 transcript_last() {
@@ -123,8 +146,7 @@ session_meta() {
 # Output, one per line, tab-separated (every field non-empty, "-" if unknown):
 #   pid idle_h rss_mb version key procstart sessionId cwd title recap app
 find_candidates() {
-  local respect_snooze="$1" now_ms f pid status updated started procstart version name cwd sid idle_h rss key meta
-  now_ms=$(( $(date +%s) * 1000 ))
+  local respect_snooze="$1" f pid status updated started procstart version name cwd sid idle_h rss key meta
   for f in "$SESSIONS_DIR"/*.json; do
     [ -e "$f" ] || continue
     IFS=$'\t' read -r pid status updated started procstart version sid name cwd < <(
@@ -134,7 +156,7 @@ find_candidates() {
     [ -n "${pid:-}" ] || continue
     [ "$status" = "idle" ] || continue
     is_count "$updated" || continue
-    idle_h=$(( (now_ms - updated) / 3600000 ))
+    idle_h=$(awake_hours "$updated")
     [ "$idle_h" -ge "$IDLE_HOURS" ] || continue
     verify_pid "$pid" "$procstart" || continue
     key="$pid:$started"
@@ -170,8 +192,7 @@ host_app() {
 
 # Why the other sessions were left out (for the dry-run output).
 summary() {
-  local now_ms f pid status updated procstart idle_h rc busy=0 recent=0 dead=0 mismatch=0
-  now_ms=$(( $(date +%s) * 1000 ))
+  local f pid status updated procstart idle_h rc busy=0 recent=0 dead=0 mismatch=0
   for f in "$SESSIONS_DIR"/*.json; do
     [ -e "$f" ] || continue
     IFS=$'\t' read -r pid status updated procstart < <(
@@ -182,7 +203,7 @@ summary() {
     if ! is_count "$updated"; then
       mismatch=$((mismatch + 1)); echo "  skipped $pid: statusUpdatedAt is '$updated', not a timestamp"; continue
     fi
-    idle_h=$(( (now_ms - updated) / 3600000 ))
+    idle_h=$(awake_hours "$updated")
     if [ "$idle_h" -lt "$IDLE_HOURS" ]; then recent=$((recent + 1)); continue; fi
     verify_pid "$pid" "$procstart"; rc=$?
     [ "$rc" -eq 1 ] && dead=$((dead + 1))
@@ -191,15 +212,15 @@ summary() {
       echo "  skipped $pid: $VERIFY_REASON"
     fi
   done
-  echo "Skipped: $busy not idle, $recent idle < ${IDLE_HOURS}h, $dead stale session files (process gone), $mismatch PID reused/unverifiable"
+  echo "Skipped: $busy not idle, $recent idle < ${IDLE_HOURS}h awake, $dead stale session files (process gone), $mismatch PID reused/unverifiable"
 }
 
-idle_text() { if [ "$1" -ge 48 ]; then echo "$(( $1 / 24 )) dies"; else echo "$1 h"; fi; }
+idle_text() { echo "$1 h"; }
 
 # The block written to a session's terminal after it is closed.
 farewell() {
   local idle="$1" sid="$2" title="$3" recap="$4"
-  printf '\n\033[2m╭─ claude-cleanup ha tancat aquesta sessió (inactiva %s)\033[0m\n' "$(idle_text "$idle")"
+  printf '\n\033[2m╭─ claude-cleanup ha tancat aquesta sessió (inactiva %s amb el Mac despert)\033[0m\n' "$(idle_text "$idle")"
   printf '\033[2m│\033[0m \033[1m%s\033[0m\n' "$title"
   if [ "$recap" != "-" ]; then
     printf '%s\n' "$recap" | fold -s -w 96 | sed $'s/^/\033[2m│\033[0m /'
@@ -271,7 +292,7 @@ pick() {
     items+=("PID $pid · $(idle_text "$idle") · $app · $title · ${cwd/#$HOME/~}")
   done <<< "$rows"
   local picked
-  picked=$(applescript_pick "Sessions de Claude inactives fa més de ${IDLE_HOURS}h. Desmarca les que vulguis mantenir." "${items[@]}") || return 2
+  picked=$(applescript_pick "Sessions de Claude inactives ${IDLE_HOURS}h o més amb el Mac despert. Desmarca les que vulguis mantenir." "${items[@]}") || return 2
   printf '%s\n' "$picked" | sed -n 's/^PID \([0-9]*\) .*/\1/p'
 }
 
@@ -318,6 +339,8 @@ if ! ps -o pid= -p $$ >/dev/null 2>&1; then
   exit 1
 fi
 
+load_sleep_periods
+
 case "$mode" in
   --close)
     # Close one session by PID right now, whatever its idle time, and write its recap to its terminal.
@@ -330,7 +353,7 @@ case "$mode" in
     if [ "$status" != "idle" ]; then echo "Session $pid is '$status', not idle. Not closing it." >&2; exit 1; fi
     verify_pid "$pid" "$procstart" || { echo "PID $pid is not that Claude session any more. ${VERIFY_REASON}" >&2; exit 1; }
     idle=0
-    is_count "$updated" && idle=$(( ($(date +%s) * 1000 - updated) / 3600000 ))
+    is_count "$updated" && idle=$(awake_hours "$updated")
     rss=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
     IFS=$'\t' read -r title recap < <(session_meta "$sid" "$name")
     echo "Closing $pid ($(host_app "$pid")): $title"
@@ -341,10 +364,10 @@ case "$mode" in
   --list|--dry-run)
     rows=$(find_candidates no)
     if [ -z "$rows" ]; then
-      echo "No sessions idle for ${IDLE_HOURS}h or more."
+      echo "No sessions idle for ${IDLE_HOURS}h or more (counting only time the Mac was awake)."
     else
       total=0; count=0
-      echo "Would offer to close (idle >= ${IDLE_HOURS}h):"
+      echo "Would offer to close (idle >= ${IDLE_HOURS}h while the Mac was awake):"
       while IFS=$'\t' read -r pid idle rss version key procstart sid cwd title recap app; do
         printf '  %6s  %8s  %5s MB  %-10s \033[1m%s\033[0m  \033[2m%s\033[0m\n' "$pid" "$(idle_text "$idle")" "$rss" "$app" "$title" "${cwd/#$HOME/~}"
         [ "$recap" != "-" ] && printf '                              \033[2m%s\033[0m\n' "${recap:0:110}"
@@ -399,7 +422,7 @@ case "$mode" in
     ;;
 
   *)
-    sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//'
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$SELF"
     exit 1
     ;;
 esac
