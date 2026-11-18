@@ -293,9 +293,12 @@ let window = NSWindow(
 window.title = "Claude cleanup"
 window.delegate = delegate
 window.contentView = NSHostingView(rootView: ContentView(store: store))
+// Under launchd, macOS 14+ may refuse activation, so the window could open behind
+// whatever you are using. Float it above other windows, on every Space, until answered.
+window.level = .floating
+window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 window.center()
 window.makeKeyAndOrderFront(nil)
-// Under launchd, macOS 14+ may refuse activation; still put the window in front.
 window.orderFrontRegardless()
 app.activate(ignoringOtherApps: true)
 app.run()

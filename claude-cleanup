@@ -416,6 +416,7 @@ case "$mode" in
       exit 0
     fi
     [ "$mode" = --test ] && test=true || test=false
+    [ "$mode" = --run ] && log "asked about $(printf '%s\n' "$rows" | grep -c .) sessions"
     picked=$(pick "$rows" "$test"); rc=$?
     chosen=$(printf '%s\n' "$picked" | sed -n 's/^snooze \([0-9][0-9]*\)$/\1/p' | head -1)
     is_count "$chosen" && [ "$chosen" -gt 0 ] && SNOOZE_HOURS="$chosen"

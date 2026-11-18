@@ -78,7 +78,9 @@ Before closing anything, the tool checks that:
 
 Closing sends `SIGTERM`, so Claude shuts down cleanly and saves the conversation. Once the process has exited, the recap is written to its terminal.
 
-Logs and snooze state live in `~/.local/state/claude-cleanup/`. The `log` file records every session closed or snoozed, with its title and session ID.
+The picker floats above other windows and shows on every Space, so a scheduled run can't open it out of sight. Until you answer, launchd doesn't start the next run.
+
+Logs and snooze state live in `~/.local/state/claude-cleanup/`. The `log` file records each time the picker opens ("asked about N sessions"), and every session closed or snoozed, with its title and session ID. An "asked" line with nothing after it means the picker was never answered.
 
 ## Caveats
 
