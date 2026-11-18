@@ -33,6 +33,7 @@ case "$IDLE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_IDLE_HOURS must be a who
 case "$SNOOZE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_SNOOZE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
 IDLE_HOURS=$((10#$IDLE_HOURS)); SNOOZE_HOURS=$((10#$SNOOZE_HOURS))
 INTERVAL_SECONDS=600
+ANSWER_TIMEOUT_SECONDS=120
 SESSIONS_DIR="$HOME/.claude/sessions"
 PROJECTS_DIR="$HOME/.claude/projects"
 STATE_DIR="$HOME/.local/state/claude-cleanup"
@@ -275,10 +276,10 @@ close_session() {
 
 # Candidate rows (stdin) -> the JSON the picker reads. $1 = test mode (true/false).
 rows_to_json() {
-  jq -Rn --argjson test "$1" --argjson idle "$IDLE_HOURS" --argjson snooze "$SNOOZE_HOURS" --arg home "$HOME" '
+  jq -Rn --argjson test "$1" --argjson idle "$IDLE_HOURS" --argjson snooze "$SNOOZE_HOURS" --argjson timeout "$ANSWER_TIMEOUT_SECONDS" --arg home "$HOME" '
     def clean: if . == "-" then "" else . end;
     { test: $test, idleThreshold: $idle,
-      snoozeHours: $snooze,
+      snoozeHours: $snooze, answerTimeout: $timeout,
       sessions: [ inputs | select(length > 0) | split("\t") | {
         pid: (.[0] | tonumber), idleHours: (.[1] | tonumber), memMB: (.[2] | tonumber),
         cwd: (.[7] | if startswith($home) then "~" + .[($home | length):] else . end),
@@ -302,7 +303,8 @@ end run
 APPLESCRIPT
 }
 
-# Picker. Prints the selected PIDs, one per line. Exit 1 = "not now", 2+ = error.
+# Picker. Prints the selected PIDs, one per line. Exit 1 = "not now", 3 = no answer in time
+# (native picker only: nothing is closed or snoozed), other non-zero = error.
 # The native picker also prints "snooze <hours>" first (its snooze menu), and its
 # "Refresca" button runs `claude-cleanup --json <test>`.
 pick() {
@@ -420,6 +422,11 @@ case "$mode" in
     picked=$(pick "$rows" "$test"); rc=$?
     chosen=$(printf '%s\n' "$picked" | sed -n 's/^snooze \([0-9][0-9]*\)$/\1/p' | head -1)
     is_count "$chosen" && [ "$chosen" -gt 0 ] && SNOOZE_HOURS="$chosen"
+    if [ "$rc" -eq 3 ]; then
+      [ "$mode" = --run ] && log "no answer in $((ANSWER_TIMEOUT_SECONDS / 60)) min: picker closed itself, nothing closed or snoozed"
+      [ "$mode" = --test ] && echo "No answer in $((ANSWER_TIMEOUT_SECONDS / 60)) min: would close or snooze nothing."
+      exit 0
+    fi
     if [ "$rc" -gt 1 ]; then
       log "picker failed (exit $rc), nothing closed or snoozed"
       echo "Picker failed (exit $rc)." >&2

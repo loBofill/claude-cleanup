@@ -2,13 +2,16 @@
 //
 // Usage: claude-cleanup-ui [refresh-command args...]
 // Reads JSON on stdin: {"test": bool, "idleThreshold": int, "snoozeHours": int (optional),
+//                       "answerTimeout": seconds (optional),
 //                       "sessions": [{pid, idleHours, memMB, title, recap, cwd, app}]}
 // If a refresh command is given, the "Refresca" button runs it; it must print the same JSON.
 // The list then follows reality: sessions that stopped being idle disappear, new
 // idle ones appear (checked), and anything you unchecked stays unchecked.
-// Always prints "snooze <hours>" first: how long the sessions left open are left alone.
+// Unless it times out, prints "snooze <hours>" first: how long the sessions left open are left alone.
 // On "close", then prints the selected PIDs (one per line) and exits 0.
 // On "not now" or closing the window, exits 1.
+// If the window is not touched within answerTimeout seconds, it closes on its own,
+// prints nothing and exits 3: nothing is closed or snoozed.
 //
 // Build: claude-cleanup --build-ui
 
@@ -30,6 +33,7 @@ struct Input: Codable {
     let test: Bool
     let idleThreshold: Int
     let snoozeHours: Int?
+    let answerTimeout: Int?
     let sessions: [Session]
 }
 
@@ -67,6 +71,7 @@ final class Store: ObservableObject {
     @Published var lastRefresh = Date()
     @Published var refreshing = false
     @Published var snoozeHours: Int { didSet { chosenSnoozeHours = snoozeHours } }
+    @Published var autoClose: ClosedRange<Date>?
     let snoozeChoices: [Int]
     private let refreshCommand: [String]
 
@@ -192,6 +197,13 @@ struct ContentView: View {
                             .foregroundStyle(.orange)
                     }
                     Spacer()
+                    if let autoClose = store.autoClose {
+                        Text("Es tanca sola en \(Text(timerInterval: autoClose))")
+                            .monospacedDigit()
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .help("Si no la toques, es tancarà sola sense tancar ni ajornar res, i et tornarà a preguntar a la propera passada")
+                    }
                     if store.refreshing {
                         ProgressView().controlSize(.small)
                     }
@@ -301,4 +313,20 @@ window.center()
 window.makeKeyAndOrderFront(nil)
 window.orderFrontRegardless()
 app.activate(ignoringOtherApps: true)
+
+let answerTimeout = input.answerTimeout ?? 120
+if answerTimeout > 0 {
+    let opened = Date()
+    store.autoClose = opened...opened.addingTimeInterval(TimeInterval(answerTimeout))
+    // A click or scroll means you are looking at it: stop the countdown. Keys don't count, since the
+    // window may take focus while you type elsewhere; nor does anything in the first 2 s.
+    _ = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]) { event in
+        if Date().timeIntervalSince(opened) > 2 { store.autoClose = nil }
+        return event
+    }
+    // Wall clock, so time asleep counts and the exit matches the countdown.
+    DispatchQueue.main.asyncAfter(wallDeadline: .now() + .seconds(answerTimeout)) {
+        if store.autoClose != nil { exit(3) }
+    }
+}
 app.run()

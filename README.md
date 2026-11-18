@@ -78,9 +78,9 @@ Before closing anything, the tool checks that:
 
 Closing sends `SIGTERM`, so Claude shuts down cleanly and saves the conversation. Once the process has exited, the recap is written to its terminal.
 
-The picker floats above other windows and shows on every Space, so a scheduled run can't open it out of sight. Until you answer, launchd doesn't start the next run.
+The picker floats above other windows and shows on every Space, so a scheduled run can't open it out of sight. If you don't touch the native picker within 2 minutes, it closes on its own without closing or snoozing anything, and the next run asks again. A click or scroll in the window stops that countdown, and from then on it waits for your answer; until you answer, launchd doesn't start the next run. The AppleScript fallback has no countdown.
 
-Logs and snooze state live in `~/.local/state/claude-cleanup/`. The `log` file records each time the picker opens ("asked about N sessions"), and every session closed or snoozed, with its title and session ID. An "asked" line with nothing after it means the picker was never answered.
+Logs and snooze state live in `~/.local/state/claude-cleanup/`. The `log` file records each time the picker opens ("asked about N sessions"), and every session closed or snoozed, with its title and session ID. A timed-out picker logs "no answer in 2 min". An "asked" line with nothing after it means the picker is still open, or was killed before you answered.
 
 ## Caveats
 
