@@ -44,14 +44,14 @@ claude-cleanup --install   # runs every 10 minutes via launchd
 
 In the picker, every session starts checked. Uncheck the ones you want to keep and press **Tanca** (close). **Refresca** (⌘R) reloads the list. The picker's text is in Catalan.
 
-Sessions you leave open are snoozed for an hour, so the scheduled run doesn't ask about them again every 10 minutes. **Ara no** (not now), or closing the window, closes nothing and snoozes every listed session. If the picker itself fails, nothing is closed or snoozed.
+Sessions you leave open are snoozed, so the scheduled run doesn't ask about them again every 10 minutes. The picker's snooze menu sets for how long: an hour by default, or 4 hours or a day. The AppleScript fallback has no menu and uses the default. **Ara no** (not now), or closing the window, closes nothing and snoozes every listed session. If the picker itself fails, nothing is closed or snoozed.
 
 ## Settings
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CLAUDE_CLEANUP_IDLE_HOURS` | `4` | How long a session must be idle, counting only time the Mac was awake, before it's offered. |
-| `CLAUDE_CLEANUP_SNOOZE_HOURS` | `1` | How long a session you chose to keep is left alone. |
+| `CLAUDE_CLEANUP_IDLE_HOURS` | `4` | How long a session must be idle, counting only time the screen was on, before it's offered. |
+| `CLAUDE_CLEANUP_SNOOZE_HOURS` | `1` | The picker's default snooze: how long a session you chose to keep is left alone. |
 
 Set them when you run `--install` and they're saved into the launchd job:
 
@@ -63,11 +63,13 @@ CLAUDE_CLEANUP_IDLE_HOURS=6 claude-cleanup --install
 
 Every running Claude Code session keeps a small status file in `~/.claude/sessions/<pid>.json`. It holds the session ID, its folder, its status (`idle`, `busy`, …) and when that status last changed. A session counts as idle when its status is `idle` and hasn't changed for the threshold.
 
-The threshold only counts time the Mac was awake, so a night the Mac spent asleep doesn't count toward it. If something kept the Mac awake overnight, such as a running `caffeinate`, those hours do count. Sleep periods come from the power log (`pmset -g log`), which keeps about a week of history. Time before that isn't counted. If the power log can't be read, plain clock time is used instead.
+The threshold only counts time the screen was on, so nights, lunch breaks and any time the Mac was kept awake with the screen off don't count toward it. Screen on/off and sleep events come from the power log (`pmset -g log`), which keeps about a week of history. Time before that isn't counted. If the power log can't be read, plain clock time is used instead.
 
 The title and recap come from the session's transcript in `~/.claude/projects/`. The title is the one you set with `/rename`, or else Claude's own title. The recap is the summary Claude writes when you step away from a session. If there's no recap, the picker shows your last message instead.
 
 The app column (Orca, Terminal, VS Code, tmux, …) comes from walking up the session's parent processes to the first macOS app.
+
+Memory is the process's physical footprint from `top`, the same figure Activity Monitor shows. An idle session's resident memory is much lower, because macOS compresses most of it, but its footprint is what closing it frees.
 
 Before closing anything, the tool checks that:
 

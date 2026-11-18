@@ -1,12 +1,13 @@
 // claude-cleanup-ui: native picker for claude-cleanup.
 //
 // Usage: claude-cleanup-ui [refresh-command args...]
-// Reads JSON on stdin: {"test": bool, "idleThreshold": int,
+// Reads JSON on stdin: {"test": bool, "idleThreshold": int, "snoozeHours": int (optional),
 //                       "sessions": [{pid, idleHours, memMB, title, recap, cwd, app}]}
 // If a refresh command is given, the "Refresca" button runs it; it must print the same JSON.
 // The list then follows reality: sessions that stopped being idle disappear, new
 // idle ones appear (checked), and anything you unchecked stays unchecked.
-// On "close", prints the selected PIDs (one per line) and exits 0.
+// Always prints "snooze <hours>" first: how long the sessions left open are left alone.
+// On "close", then prints the selected PIDs (one per line) and exits 0.
 // On "not now" or closing the window, exits 1.
 //
 // Build: claude-cleanup --build-ui
@@ -28,16 +29,28 @@ struct Session: Codable, Identifiable {
 struct Input: Codable {
     let test: Bool
     let idleThreshold: Int
+    let snoozeHours: Int?
     let sessions: [Session]
 }
 
+var chosenSnoozeHours = 1
+
 func finish(_ pids: [Int]?) -> Never {
+    print("snooze \(chosenSnoozeHours)")
     if let pids {
         print(pids.map(String.init).joined(separator: "\n"))
-        fflush(stdout)
-        exit(0)
     }
-    exit(1)
+    fflush(stdout)
+    exit(pids == nil ? 1 : 0)
+}
+
+func snoozeText(_ hours: Int) -> String {
+    switch hours {
+    case 1: return "una hora"
+    case 24: return "un dia"
+    case let h where h > 24 && h % 24 == 0: return "\(h / 24) dies"
+    default: return "\(hours) hores"
+    }
 }
 
 func idleText(_ hours: Int) -> String {
@@ -53,11 +66,17 @@ final class Store: ObservableObject {
     @Published var unchecked: Set<Int> = []
     @Published var lastRefresh = Date()
     @Published var refreshing = false
+    @Published var snoozeHours: Int { didSet { chosenSnoozeHours = snoozeHours } }
+    let snoozeChoices: [Int]
     private let refreshCommand: [String]
 
     init(input: Input, refreshCommand: [String]) {
         self.input = input
         self.refreshCommand = refreshCommand
+        let initial = input.snoozeHours ?? 1
+        snoozeHours = initial
+        snoozeChoices = Array(Set([1, 4, 24, initial])).sorted()
+        chosenSnoozeHours = initial
     }
 
     var selected: [Session] { input.sessions.filter { !unchecked.contains($0.pid) } }
@@ -185,7 +204,7 @@ struct ContentView: View {
                     .keyboardShortcut("r", modifiers: .command)
                     .help("Torna a llegir quines sessions estan inactives (⌘R)")
                 }
-                Text("Porten \(input.idleThreshold) h o més sense fer res, comptant només quan el Mac està despert. Desmarca les que vulguis mantenir. Les que tanquis es poden reprendre amb claude --resume, i el recap queda escrit al seu terminal.")
+                Text("Porten \(input.idleThreshold) h o més sense fer res, comptant només quan la pantalla està encesa. Desmarca les que vulguis mantenir. Les que tanquis es poden reprendre amb claude --resume, i el recap queda escrit al seu terminal.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -232,6 +251,11 @@ struct ContentView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Spacer()
+                Picker("Les altres, torna-m'ho a preguntar d'aquí a", selection: $store.snoozeHours) {
+                    ForEach(store.snoozeChoices, id: \.self) { Text(snoozeText($0)).tag($0) }
+                }
+                .fixedSize()
+                .help("Val per a les sessions desmarcades, i per a totes si prems Ara no o tanques la finestra")
                 Button("Ara no") { finish(nil) }
                     .keyboardShortcut(.cancelAction)
                 // Mouse only (no Return, no Tab focus): the window opens on its own and may take focus while you type.
@@ -244,7 +268,7 @@ struct ContentView: View {
             }
             .padding(16)
         }
-        .frame(minWidth: 560, minHeight: 420)
+        .frame(minWidth: 720, minHeight: 420)
     }
 }
 
@@ -263,7 +287,7 @@ let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 let delegate = WindowDelegate()
 let window = NSWindow(
-    contentRect: NSRect(x: 0, y: 0, width: 760, height: 680),
+    contentRect: NSRect(x: 0, y: 0, width: 860, height: 680),
     styleMask: [.titled, .closable, .resizable],
     backing: .buffered, defer: false)
 window.title = "Claude cleanup"

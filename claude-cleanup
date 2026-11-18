@@ -15,7 +15,7 @@
 #
 # Env: CLAUDE_CLEANUP_IDLE_HOURS (default 4), CLAUDE_CLEANUP_SNOOZE_HOURS (default 1)
 #
-# Idle time only counts while the Mac is awake: sleep periods come from `pmset -g log`.
+# Idle time only counts while the screen is on: display on/off and sleep events come from `pmset -g log`.
 #
 # Data sources:
 #   ~/.claude/sessions/<pid>.json        pid, status, statusUpdatedAt, procStart, startedAt, sessionId,
@@ -31,6 +31,7 @@ IDLE_HOURS="${CLAUDE_CLEANUP_IDLE_HOURS:-4}"
 SNOOZE_HOURS="${CLAUDE_CLEANUP_SNOOZE_HOURS:-1}"
 case "$IDLE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_IDLE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
 case "$SNOOZE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_SNOOZE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
+IDLE_HOURS=$((10#$IDLE_HOURS)); SNOOZE_HOURS=$((10#$SNOOZE_HOURS))
 INTERVAL_SECONDS=600
 SESSIONS_DIR="$HOME/.claude/sessions"
 PROJECTS_DIR="$HOME/.claude/projects"
@@ -97,25 +98,46 @@ snooze() {
   mv "$tmp" "$SNOOZE_FILE"
 }
 
-# Sets SLEEP_PERIODS to the Mac's sleep periods as "start end" epoch lines (end -1 = still
-# asleep), from the power log (about a week of history). Time before the log starts is
-# one sleep period, so it never counts as idle. Kept in memory, not in a shared file,
-# so concurrent runs (the picker's refresh, launchd) can't read a half-written list.
-load_sleep_periods() {
-  SLEEP_PERIODS=$(pmset -g log 2>/dev/null | perl -MTime::Local -ne '
-    next unless /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) ([+-])(\d\d)(\d\d) (Sleep|Wake) {2,}/;
+# Sets SCREEN_OFF_PERIODS to the periods the screen was off as "start end" epoch lines
+# (end -1 = still off), from the power log (about a week of history). A full wake also
+# counts as screen on, so a log without display events degrades to awake time. Time
+# before the log starts is one off period, so it never counts as idle.
+load_screen_off_periods() {
+  SCREEN_OFF_PERIODS=$(pmset -g log 2>/dev/null | perl -MTime::Local -ne '
+    next unless /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) ([+-])(\d\d)(\d\d) (?:(Sleep) {2,}|Wake {2,}|Notification\s+Display is turned (on|off)\b)/;
     my $t = timegm($6, $5, $4, $3, $2 - 1, $1) - ($7 eq "-" ? -1 : 1) * ($8 * 3600 + $9 * 60);
+    my $off = defined $10 || $11 eq "off";
     $first //= $t;
-    if ($10 eq "Sleep") { $since //= $t } elsif (defined $since) { print "$since $t\n"; undef $since }
+    if ($off) { $since //= $t } elsif (defined $since) { print "$since $t\n"; undef $since }
     END { print "0 $first\n" if defined $first; print "$since -1\n" if defined $since }')
-  [ -n "$SLEEP_PERIODS" ] || log "power log unreadable: idle time falls back to clock time"
+  [ -n "$SCREEN_OFF_PERIODS" ] || log "power log unreadable: idle time falls back to clock time"
 }
 
-# Whole hours the Mac was awake since a timestamp in ms. Without a power log, wall-clock hours.
-awake_hours() {
-  printf '%s\n' "${SLEEP_PERIODS:-}" | awk -v s="$(( $1 / 1000 ))" -v n="$(date +%s)" '
-    NF == 2 { a = $1; b = ($2 < 0 ? n : $2); if (a < s) a = s; if (b > n) b = n; if (b > a) slept += b - a }
-    END { t = n - s - slept; if (t < 0) t = 0; print int(t / 3600) }'
+# Sets FOOTPRINTS to "pid MB" lines for every process, from top's MEM column: the
+# physical footprint Activity Monitor shows. A PID may carry an architecture marker.
+load_footprints() {
+  FOOTPRINTS=$(top -l 1 -F -stats pid,mem 2>/dev/null | awk '
+    $1 ~ /^[0-9]+[*+-]?$/ && $2 ~ /^[0-9.]+[BKMGT][+-]?$/ {
+      pid = $1; sub(/[*+-]$/, "", pid)
+      v = $2; sub(/[+-]$/, "", v); unit = substr(v, length(v)); n = substr(v, 1, length(v) - 1) + 0
+      mb = (unit == "T") ? n * 1048576 : (unit == "G") ? n * 1024 : (unit == "M") ? n : (unit == "K") ? n / 1024 : n / 1048576
+      printf "%s %d\n", pid, mb
+    }')
+  [ -n "$FOOTPRINTS" ] || log "top reported no memory: using RSS instead of footprint"
+}
+
+memory_mb() {
+  local mb
+  mb=$(printf '%s\n' "${FOOTPRINTS:-}" | awk -v p="$1" '$1 == p { print $2; exit }')
+  [ -n "$mb" ] || mb=$(( $(ps -o rss= -p "$1" 2>/dev/null || echo 0) / 1024 ))
+  echo "$mb"
+}
+
+# Whole hours the screen was on since a timestamp in ms. Without a power log, wall-clock hours.
+screen_on_hours() {
+  printf '%s\n' "${SCREEN_OFF_PERIODS:-}" | awk -v s="$(( $1 / 1000 ))" -v n="$(date +%s)" '
+    NF == 2 { a = $1; b = ($2 < 0 ? n : $2); if (a < s) a = s; if (b > n) b = n; if (b > a) off += b - a }
+    END { t = n - s - off; if (t < 0) t = 0; print int(t / 3600) }'
 }
 
 # Latest entry of a given kind in a transcript, read from the end of the file.
@@ -144,9 +166,9 @@ session_meta() {
 }
 
 # Output, one per line, tab-separated (every field non-empty, "-" if unknown):
-#   pid idle_h rss_mb version key procstart sessionId cwd title recap app
+#   pid idle_h mem_mb version key procstart sessionId cwd title recap app
 find_candidates() {
-  local respect_snooze="$1" f pid status updated started procstart version name cwd sid idle_h rss key meta
+  local respect_snooze="$1" f pid status updated started procstart version name cwd sid idle_h mem key meta
   for f in "$SESSIONS_DIR"/*.json; do
     [ -e "$f" ] || continue
     IFS=$'\t' read -r pid status updated started procstart version sid name cwd < <(
@@ -156,15 +178,16 @@ find_candidates() {
     [ -n "${pid:-}" ] || continue
     [ "$status" = "idle" ] || continue
     is_count "$updated" || continue
-    idle_h=$(awake_hours "$updated")
+    idle_h=$(screen_on_hours "$updated")
     [ "$idle_h" -ge "$IDLE_HOURS" ] || continue
     verify_pid "$pid" "$procstart" || continue
     key="$pid:$started"
     if [ "$respect_snooze" = yes ] && is_snoozed "$key"; then continue; fi
-    rss=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
+    [ -n "${FOOTPRINTS+set}" ] || load_footprints
+    mem=$(memory_mb "$pid")
     meta=$(session_meta "$sid" "$name")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$pid" "$idle_h" "$rss" "$version" "$key" "$procstart" "$sid" "$cwd" "$meta" "$(host_app "$pid")"
+      "$pid" "$idle_h" "$mem" "$version" "$key" "$procstart" "$sid" "$cwd" "$meta" "$(host_app "$pid")"
   done | sort -t$'\t' -k2 -rn
 }
 
@@ -203,7 +226,7 @@ summary() {
     if ! is_count "$updated"; then
       mismatch=$((mismatch + 1)); echo "  skipped $pid: statusUpdatedAt is '$updated', not a timestamp"; continue
     fi
-    idle_h=$(awake_hours "$updated")
+    idle_h=$(screen_on_hours "$updated")
     if [ "$idle_h" -lt "$IDLE_HOURS" ]; then recent=$((recent + 1)); continue; fi
     verify_pid "$pid" "$procstart"; rc=$?
     [ "$rc" -eq 1 ] && dead=$((dead + 1))
@@ -212,7 +235,7 @@ summary() {
       echo "  skipped $pid: $VERIFY_REASON"
     fi
   done
-  echo "Skipped: $busy not idle, $recent idle < ${IDLE_HOURS}h awake, $dead stale session files (process gone), $mismatch PID reused/unverifiable"
+  echo "Skipped: $busy not idle, $recent idle < ${IDLE_HOURS}h screen-on, $dead stale session files (process gone), $mismatch PID reused/unverifiable"
 }
 
 idle_text() { echo "$1 h"; }
@@ -220,7 +243,7 @@ idle_text() { echo "$1 h"; }
 # The block written to a session's terminal after it is closed.
 farewell() {
   local idle="$1" sid="$2" title="$3" recap="$4"
-  printf '\n\033[2m╭─ claude-cleanup ha tancat aquesta sessió (inactiva %s amb el Mac despert)\033[0m\n' "$(idle_text "$idle")"
+  printf '\n\033[2m╭─ claude-cleanup ha tancat aquesta sessió (inactiva %s amb la pantalla encesa)\033[0m\n' "$(idle_text "$idle")"
   printf '\033[2m│\033[0m \033[1m%s\033[0m\n' "$title"
   if [ "$recap" != "-" ]; then
     printf '%s\n' "$recap" | fold -s -w 96 | sed $'s/^/\033[2m│\033[0m /'
@@ -231,14 +254,14 @@ farewell() {
 
 # Closes one session and, once it has exited, writes the farewell block to its terminal.
 close_session() {
-  local pid="$1" procstart="$2" idle="$3" rss="$4" sid="$5" cwd="$6" title="$7" recap="$8" tty i
+  local pid="$1" procstart="$2" idle="$3" mem="$4" sid="$5" cwd="$6" title="$7" recap="$8" tty i
   verify_pid "$pid" "$procstart" || { log "skip $pid: no longer the same process"; return; }
   if [ "$(jq -r '.status // "-"' "$SESSIONS_DIR/$pid.json" 2>/dev/null)" != "idle" ]; then
     log "skip $pid: no longer idle"; return
   fi
   tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
   kill -TERM "$pid" || { log "kill failed for $pid"; return; }
-  log "closed $pid \"$title\" (${idle}h idle, ${rss} MB, $cwd, session $sid)"
+  log "closed $pid \"$title\" (${idle}h idle, ${mem} MB, $cwd, session $sid)"
   # Some sessions take well over 10s to exit after SIGTERM; closes run in parallel, so waiting is cheap.
   for i in $(seq 1 300); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
   if kill -0 "$pid" 2>/dev/null; then log "still running 60s after SIGTERM: $pid"; return; fi
@@ -252,9 +275,10 @@ close_session() {
 
 # Candidate rows (stdin) -> the JSON the picker reads. $1 = test mode (true/false).
 rows_to_json() {
-  jq -Rn --argjson test "$1" --argjson idle "$IDLE_HOURS" --arg home "$HOME" '
+  jq -Rn --argjson test "$1" --argjson idle "$IDLE_HOURS" --argjson snooze "$SNOOZE_HOURS" --arg home "$HOME" '
     def clean: if . == "-" then "" else . end;
     { test: $test, idleThreshold: $idle,
+      snoozeHours: $snooze,
       sessions: [ inputs | select(length > 0) | split("\t") | {
         pid: (.[0] | tonumber), idleHours: (.[1] | tonumber), memMB: (.[2] | tonumber),
         cwd: (.[7] | if startswith($home) then "~" + .[($home | length):] else . end),
@@ -279,7 +303,8 @@ APPLESCRIPT
 }
 
 # Picker. Prints the selected PIDs, one per line. Exit 1 = "not now", 2+ = error.
-# The native picker's "Refresca" button runs `claude-cleanup --json <test>`.
+# The native picker also prints "snooze <hours>" first (its snooze menu), and its
+# "Refresca" button runs `claude-cleanup --json <test>`.
 pick() {
   local rows="$1" test="$2"
   if [ -x "$UI_BIN" ]; then
@@ -287,12 +312,12 @@ pick() {
     return $?
   fi
   # Fallback: plain AppleScript list.
-  local items=() pid idle rss title cwd
-  while IFS=$'\t' read -r pid idle rss _ _ _ _ cwd title _ app; do
+  local items=() pid idle mem title cwd
+  while IFS=$'\t' read -r pid idle mem _ _ _ _ cwd title _ app; do
     items+=("PID $pid · $(idle_text "$idle") · $app · $title · ${cwd/#$HOME/~}")
   done <<< "$rows"
   local picked
-  picked=$(applescript_pick "Sessions de Claude inactives ${IDLE_HOURS}h o més amb el Mac despert. Desmarca les que vulguis mantenir." "${items[@]}") || return 2
+  picked=$(applescript_pick "Sessions de Claude inactives ${IDLE_HOURS}h o més amb la pantalla encesa. Desmarca les que vulguis mantenir." "${items[@]}") || return 2
   printf '%s\n' "$picked" | sed -n 's/^PID \([0-9]*\) .*/\1/p'
 }
 
@@ -339,7 +364,7 @@ if ! ps -o pid= -p $$ >/dev/null 2>&1; then
   exit 1
 fi
 
-load_sleep_periods
+load_screen_off_periods
 
 case "$mode" in
   --close)
@@ -353,27 +378,28 @@ case "$mode" in
     if [ "$status" != "idle" ]; then echo "Session $pid is '$status', not idle. Not closing it." >&2; exit 1; fi
     verify_pid "$pid" "$procstart" || { echo "PID $pid is not that Claude session any more. ${VERIFY_REASON}" >&2; exit 1; }
     idle=0
-    is_count "$updated" && idle=$(awake_hours "$updated")
-    rss=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
+    is_count "$updated" && idle=$(screen_on_hours "$updated")
+    load_footprints
+    mem=$(memory_mb "$pid")
     IFS=$'\t' read -r title recap < <(session_meta "$sid" "$name")
     echo "Closing $pid ($(host_app "$pid")): $title"
-    close_session "$pid" "$procstart" "$idle" "$rss" "$sid" "$cwd" "$title" "$recap"
+    close_session "$pid" "$procstart" "$idle" "$mem" "$sid" "$cwd" "$title" "$recap"
     tail -1 "$LOG_FILE"
     ;;
 
   --list|--dry-run)
     rows=$(find_candidates no)
     if [ -z "$rows" ]; then
-      echo "No sessions idle for ${IDLE_HOURS}h or more (counting only time the Mac was awake)."
+      echo "No sessions idle for ${IDLE_HOURS}h or more (counting only time the screen was on)."
     else
       total=0; count=0
-      echo "Would offer to close (idle >= ${IDLE_HOURS}h while the Mac was awake):"
-      while IFS=$'\t' read -r pid idle rss version key procstart sid cwd title recap app; do
-        printf '  %6s  %8s  %5s MB  %-10s \033[1m%s\033[0m  \033[2m%s\033[0m\n' "$pid" "$(idle_text "$idle")" "$rss" "$app" "$title" "${cwd/#$HOME/~}"
+      echo "Would offer to close (idle >= ${IDLE_HOURS}h while the screen was on):"
+      while IFS=$'\t' read -r pid idle mem version key procstart sid cwd title recap app; do
+        printf '  %6s  %8s  %5s MB  %-10s \033[1m%s\033[0m  \033[2m%s\033[0m\n' "$pid" "$(idle_text "$idle")" "$mem" "$app" "$title" "${cwd/#$HOME/~}"
         [ "$recap" != "-" ] && printf '                              \033[2m%s\033[0m\n' "${recap:0:110}"
-        total=$((total + rss)); count=$((count + 1))
+        total=$((total + mem)); count=$((count + 1))
       done <<< "$rows"
-      echo "$count sessions, roughly $total MB resident."
+      echo "$count sessions, roughly $total MB."
     fi
     summary
     ;;
@@ -391,6 +417,8 @@ case "$mode" in
     fi
     [ "$mode" = --test ] && test=true || test=false
     picked=$(pick "$rows" "$test"); rc=$?
+    chosen=$(printf '%s\n' "$picked" | sed -n 's/^snooze \([0-9][0-9]*\)$/\1/p' | head -1)
+    is_count "$chosen" && [ "$chosen" -gt 0 ] && SNOOZE_HOURS="$chosen"
     if [ "$rc" -gt 1 ]; then
       log "picker failed (exit $rc), nothing closed or snoozed"
       echo "Picker failed (exit $rc)." >&2
@@ -400,15 +428,16 @@ case "$mode" in
     # The window may have been open for a long time: act on the sessions that are
     # idle right now, not on the list from when it opened. A picked session that
     # is no longer idle is simply not in this list, so it is left alone.
+    load_screen_off_periods
     rows=$(find_candidates yes)
-    while IFS=$'\t' read -r pid idle rss version key procstart sid cwd title recap app; do
+    while IFS=$'\t' read -r pid idle mem version key procstart sid cwd title recap app; do
       [ -n "$pid" ] || continue
       if printf '%s\n' "$picked" | grep -qx "$pid"; then
         if [ "$mode" = --test ]; then
           echo "would close  $pid  $title"
           farewell "$idle" "$sid" "$title" "$recap" | sed 's/^/    /'
         else
-          close_session "$pid" "$procstart" "$idle" "$rss" "$sid" "$cwd" "$title" "$recap" &
+          close_session "$pid" "$procstart" "$idle" "$mem" "$sid" "$cwd" "$title" "$recap" &
         fi
       else
         if [ "$mode" = --test ]; then
