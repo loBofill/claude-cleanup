@@ -1,0 +1,405 @@
+#!/bin/bash
+# claude-cleanup: find Claude Code sessions that have sat idle for a long time
+# and offer to close them. Conversations are saved to disk, so `claude --resume`
+# brings any of them back. When a session is closed, its title, its last recap
+# and the resume command are written to the terminal it was running in.
+#
+# Usage:
+#   claude-cleanup              list candidates, change nothing (dry run)
+#   claude-cleanup --test       show the picker, report what it would do, close nothing
+#   claude-cleanup --run        show the picker and close what you pick (what launchd runs)
+#   claude-cleanup --close PID  close one session now and write its recap to its terminal
+#   claude-cleanup --build-ui   compile the native picker (claude-cleanup-ui)
+#   claude-cleanup --install    run --run every 10 minutes via launchd
+#   claude-cleanup --uninstall  remove the launchd job
+#
+# Env: CLAUDE_CLEANUP_IDLE_HOURS (default 12), CLAUDE_CLEANUP_SNOOZE_HOURS (default 1)
+#
+# Data sources:
+#   ~/.claude/sessions/<pid>.json        pid, status, statusUpdatedAt, procStart, startedAt, sessionId,
+#                                        name, version, cwd (one file per running session)
+#   ~/.claude/projects/*/<sessionId>.jsonl  transcript: custom-title, ai-title, away_summary (the recap)
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd starts jobs in the C locale, where cut/fold would split accented characters.
+export LC_CTYPE="${LC_CTYPE:-en_US.UTF-8}"
+
+IDLE_HOURS="${CLAUDE_CLEANUP_IDLE_HOURS:-12}"
+SNOOZE_HOURS="${CLAUDE_CLEANUP_SNOOZE_HOURS:-1}"
+case "$IDLE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_IDLE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
+case "$SNOOZE_HOURS" in ""|*[!0-9]*) echo "CLAUDE_CLEANUP_SNOOZE_HOURS must be a whole number of hours" >&2; exit 1 ;; esac
+INTERVAL_SECONDS=600
+SESSIONS_DIR="$HOME/.claude/sessions"
+PROJECTS_DIR="$HOME/.claude/projects"
+STATE_DIR="$HOME/.local/state/claude-cleanup"
+SNOOZE_FILE="$STATE_DIR/snoozed"
+LOG_FILE="$STATE_DIR/log"
+LABEL="com.claude-cleanup"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SELF="$(realpath "$0")"  # resolve the ~/bin symlink so the picker is found next to the real script
+UI_BIN="$(dirname "$SELF")/claude-cleanup-ui"
+UI_SRC="$UI_BIN.swift"
+
+mode="${1:---list}"
+mkdir -p "$STATE_DIR"
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG_FILE"; }
+squeeze() { sed 's/  */ /g; s/^ //; s/ $//'; }
+oneline() { perl -CS -0777 -pe 's/[\t\r\n]/ /g; s/[\x00-\x1f\x7f-\x9f]//g' | squeeze; }
+is_count() { case "$1" in ""|*[!0-9]*) return 1 ;; esac; }
+
+# Fails if PID is not a live Claude process matching the session file
+# (dead PID, or PID reused by something else). VERIFY_REASON says why.
+verify_pid() {
+  local pid="$1" procstart="$2" comm args lstart lstart_local
+  VERIFY_REASON=""
+  if ! is_count "$pid" || [ "$pid" -le 1 ]; then VERIFY_REASON="bad pid '$pid'"; return 4; fi
+  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+  [ -n "$comm" ] || return 1
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  case "$comm $args" in
+    *claude*) ;;
+    *) VERIFY_REASON="not a claude process: comm='$comm' args='${args:0:80}'"; return 2 ;;
+  esac
+  # Claude writes procStart in UTC, English (e.g. "Wed Nov  4 21:52:37 2026").
+  # Compare in UTC, and also accept local time in case that ever changes.
+  if [ -z "$procstart" ] || [ "$procstart" = "-" ]; then
+    VERIFY_REASON="no procStart in the session file, so a reused PID can't be ruled out"
+    return 3
+  fi
+  procstart=$(echo "$procstart" | squeeze)
+  lstart=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | squeeze)
+  [ "$lstart" = "$procstart" ] && return 0
+  lstart_local=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | squeeze)
+  [ "$lstart_local" = "$procstart" ] && return 0
+  VERIFY_REASON="start time differs: ps='$lstart' (UTC) session file='$procstart'"
+  return 3
+}
+
+is_snoozed() {
+  local key="$1" now until
+  now=$(date +%s)
+  until=$(awk -F'\t' -v k="$key" '$1 == k { print $2 }' "$SNOOZE_FILE" 2>/dev/null | tail -1)
+  [ -n "$until" ] && [ "$until" -gt "$now" ]
+}
+
+snooze() {
+  local key="$1" until now tmp
+  now=$(date +%s)
+  until=$(( now + SNOOZE_HOURS * 3600 ))
+  tmp="$SNOOZE_FILE.tmp"
+  # Drop expired entries and any older entry for this key, then append.
+  awk -F'\t' -v k="$key" -v now="$now" '$1 != k && $2 > now' "$SNOOZE_FILE" 2>/dev/null > "$tmp"
+  printf '%s\t%s\n' "$key" "$until" >> "$tmp"
+  mv "$tmp" "$SNOOZE_FILE"
+}
+
+# Latest entry of a given kind in a transcript, read from the end of the file.
+# $1 file, $2 grep pattern, $3 jq filter that selects and extracts the value.
+transcript_last() {
+  tail -r "$1" 2>/dev/null | grep -m5 -F "$2" | jq -r "($3)"' | gsub("[\r\n\t]+"; " ")' 2>/dev/null | head -1
+}
+
+# Prints "title<TAB>recap" for a session; falls back to the session name and
+# to the last prompt when there is no title or recap.
+session_meta() {
+  local sid="$1" fallback="$2" f t title="" recap=""
+  for t in "$PROJECTS_DIR"/*/"$sid".jsonl; do [ -e "$t" ] && { f="$t"; break; }; done
+  if [ -n "${f:-}" ]; then
+    title=$(transcript_last "$f" '"type":"custom-title"' 'select(.type == "custom-title") | .customTitle // empty')
+    [ -n "$title" ] || title=$(transcript_last "$f" '"type":"ai-title"' 'select(.type == "ai-title") | .aiTitle // empty')
+    recap=$(transcript_last "$f" '"subtype":"away_summary"' 'select(.subtype == "away_summary") | .content // empty')
+    if [ -z "$recap" ]; then
+      recap=$(transcript_last "$f" '"type":"last-prompt"' 'select(.type == "last-prompt") | .lastPrompt // empty')
+      [ -n "$recap" ] && recap="Últim missatge teu: $recap"
+    fi
+  fi
+  title=$(printf '%s' "${title:-$fallback}" | oneline)
+  recap=$(printf "%s" "$recap" | oneline | sed "s/ *(disable recaps in \/config)$//" | cut -c1-600)
+  printf '%s\t%s\n' "${title:--}" "${recap:--}"
+}
+
+# Output, one per line, tab-separated (every field non-empty, "-" if unknown):
+#   pid idle_h rss_mb version key procstart sessionId cwd title recap app
+find_candidates() {
+  local respect_snooze="$1" now_ms f pid status updated started procstart version name cwd sid idle_h rss key meta
+  now_ms=$(( $(date +%s) * 1000 ))
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    IFS=$'\t' read -r pid status updated started procstart version sid name cwd < <(
+      jq -r '[.pid, (.status // "-"), (.statusUpdatedAt // "-"), (.startedAt // "-"), (.procStart // "-"),
+              (.version // "-"), (.sessionId // "-"), (.name // "-"), (.cwd // "-")]
+             | map(tostring | if . == "" then "-" else . end) | @tsv' "$f" 2>/dev/null)
+    [ -n "${pid:-}" ] || continue
+    [ "$status" = "idle" ] || continue
+    is_count "$updated" || continue
+    idle_h=$(( (now_ms - updated) / 3600000 ))
+    [ "$idle_h" -ge "$IDLE_HOURS" ] || continue
+    verify_pid "$pid" "$procstart" || continue
+    key="$pid:$started"
+    if [ "$respect_snooze" = yes ] && is_snoozed "$key"; then continue; fi
+    rss=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
+    meta=$(session_meta "$sid" "$name")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$pid" "$idle_h" "$rss" "$version" "$key" "$procstart" "$sid" "$cwd" "$meta" "$(host_app "$pid")"
+  done | sort -t$'\t' -k2 -rn
+}
+
+# The app hosting a session (Orca, Terminal, Code, Claude, iTerm, tmux, ...):
+# walk up the parent processes and return the first macOS .app bundle found.
+host_app() {
+  local p="$1" i comm app
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    { [ -n "$p" ] && [ "$p" -gt 1 ]; } || break
+    comm=$(ps -o comm= -p "$p" 2>/dev/null)
+    case "$comm" in *tmux*) echo "tmux"; return ;; esac
+    app=$(printf '%s' "$comm" | grep -o '/[^/]*\.app/' | head -1 | sed 's#^/##; s#\.app/$##')
+    case "$app" in
+      "") continue ;;
+      Code|"Code "*|"Visual Studio Code"*) echo "VS Code" ;;
+      "Orca "*) echo "Orca" ;;        # e.g. "Orca Terminal Host", "Orca Helper"
+      "Claude "*) echo "Claude" ;;    # e.g. "Claude Helper"
+      *) echo "$app" ;;
+    esac
+    return
+  done
+  echo "-"
+}
+
+# Why the other sessions were left out (for the dry-run output).
+summary() {
+  local now_ms f pid status updated procstart idle_h rc busy=0 recent=0 dead=0 mismatch=0
+  now_ms=$(( $(date +%s) * 1000 ))
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    IFS=$'\t' read -r pid status updated procstart < <(
+      jq -r '[.pid, (.status // "-"), (.statusUpdatedAt // "-"), (.procStart // "-")]
+             | map(tostring | if . == "" then "-" else . end) | @tsv' "$f" 2>/dev/null)
+    [ -n "${pid:-}" ] || continue
+    if [ "$status" != "idle" ]; then busy=$((busy + 1)); continue; fi
+    if ! is_count "$updated"; then
+      mismatch=$((mismatch + 1)); echo "  skipped $pid: statusUpdatedAt is '$updated', not a timestamp"; continue
+    fi
+    idle_h=$(( (now_ms - updated) / 3600000 ))
+    if [ "$idle_h" -lt "$IDLE_HOURS" ]; then recent=$((recent + 1)); continue; fi
+    verify_pid "$pid" "$procstart"; rc=$?
+    [ "$rc" -eq 1 ] && dead=$((dead + 1))
+    if [ "$rc" -gt 1 ]; then
+      mismatch=$((mismatch + 1))
+      echo "  skipped $pid: $VERIFY_REASON"
+    fi
+  done
+  echo "Skipped: $busy not idle, $recent idle < ${IDLE_HOURS}h, $dead stale session files (process gone), $mismatch PID reused/unverifiable"
+}
+
+idle_text() { if [ "$1" -ge 48 ]; then echo "$(( $1 / 24 )) dies"; else echo "$1 h"; fi; }
+
+# The block written to a session's terminal after it is closed.
+farewell() {
+  local idle="$1" sid="$2" title="$3" recap="$4"
+  printf '\n\033[2m╭─ claude-cleanup ha tancat aquesta sessió (inactiva %s)\033[0m\n' "$(idle_text "$idle")"
+  printf '\033[2m│\033[0m \033[1m%s\033[0m\n' "$title"
+  if [ "$recap" != "-" ]; then
+    printf '%s\n' "$recap" | fold -s -w 96 | sed $'s/^/\033[2m│\033[0m /'
+  fi
+  # Claude itself prints "Resume this session with: claude --resume <id>" on exit, just above.
+  printf '\033[2m╰─\033[0m\n'
+}
+
+# Closes one session and, once it has exited, writes the farewell block to its terminal.
+close_session() {
+  local pid="$1" procstart="$2" idle="$3" rss="$4" sid="$5" cwd="$6" title="$7" recap="$8" tty i
+  verify_pid "$pid" "$procstart" || { log "skip $pid: no longer the same process"; return; }
+  if [ "$(jq -r '.status // "-"' "$SESSIONS_DIR/$pid.json" 2>/dev/null)" != "idle" ]; then
+    log "skip $pid: no longer idle"; return
+  fi
+  tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+  kill -TERM "$pid" || { log "kill failed for $pid"; return; }
+  log "closed $pid \"$title\" (${idle}h idle, ${rss} MB, $cwd, session $sid)"
+  # Some sessions take well over 10s to exit after SIGTERM; closes run in parallel, so waiting is cheap.
+  for i in $(seq 1 300); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  if kill -0 "$pid" 2>/dev/null; then log "still running 60s after SIGTERM: $pid"; return; fi
+  case "$tty" in ""|"??"|"-") log "recap for $pid not shown: no terminal"; return ;; esac
+  if [ -w "/dev/$tty" ] && farewell "$idle" "$sid" "$title" "$recap" > "/dev/$tty" 2>/dev/null; then
+    log "recap for $pid written to /dev/$tty"
+  else
+    log "recap for $pid not shown: /dev/$tty is gone (terminal closed with the session?)"
+  fi
+}
+
+# Candidate rows (stdin) -> the JSON the picker reads. $1 = test mode (true/false).
+rows_to_json() {
+  jq -Rn --argjson test "$1" --argjson idle "$IDLE_HOURS" --arg home "$HOME" '
+    def clean: if . == "-" then "" else . end;
+    { test: $test, idleThreshold: $idle,
+      sessions: [ inputs | select(length > 0) | split("\t") | {
+        pid: (.[0] | tonumber), idleHours: (.[1] | tonumber), memMB: (.[2] | tonumber),
+        cwd: (.[7] | if startswith($home) then "~" + .[($home | length):] else . end),
+        title: .[8], recap: (.[9] | clean), app: (.[10] // "-" | clean) } ] }'
+}
+
+# AppleScript fallback picker. $1 = prompt, rest = items; prints the chosen items.
+# Kept out of $( ) because bash 3.2 misparses a quoted heredoc inside command substitution.
+applescript_pick() {
+  osascript - "$@" <<'APPLESCRIPT'
+on run argv
+  set theItems to items 2 thru -1 of argv
+  activate
+  set picked to choose from list theItems with title "Claude cleanup" with prompt (item 1 of argv) ¬
+    default items theItems OK button name "Tanca les seleccionades" cancel button name "Ara no" ¬
+    with multiple selections allowed
+  if picked is false then return ""
+  set AppleScript's text item delimiters to linefeed
+  return picked as text
+end run
+APPLESCRIPT
+}
+
+# Picker. Prints the selected PIDs, one per line. Exit 1 = "not now", 2+ = error.
+# The native picker's "Refresca" button runs `claude-cleanup --json <test>`.
+pick() {
+  local rows="$1" test="$2"
+  if [ -x "$UI_BIN" ]; then
+    printf '%s\n' "$rows" | rows_to_json "$test" | "$UI_BIN" "$SELF" --json "$test"
+    return $?
+  fi
+  # Fallback: plain AppleScript list.
+  local items=() pid idle rss title cwd
+  while IFS=$'\t' read -r pid idle rss _ _ _ _ cwd title _ app; do
+    items+=("PID $pid · $(idle_text "$idle") · $app · $title · ${cwd/#$HOME/~}")
+  done <<< "$rows"
+  local picked
+  picked=$(applescript_pick "Sessions de Claude inactives fa més de ${IDLE_HOURS}h. Desmarca les que vulguis mantenir." "${items[@]}") || return 2
+  printf '%s\n' "$picked" | sed -n 's/^PID \([0-9]*\) .*/\1/p'
+}
+
+case "$mode" in
+  --build-ui)
+    xcrun swiftc -O "$UI_SRC" -o "$UI_BIN" && echo "Built $UI_BIN"
+    exit $?
+    ;;
+  --install)
+    mkdir -p "$(dirname "$PLIST")"
+    cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$SELF</string><string>--run</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CLEANUP_IDLE_HOURS</key><string>$IDLE_HOURS</string>
+    <key>CLAUDE_CLEANUP_SNOOZE_HOURS</key><string>$SNOOZE_HOURS</string>
+  </dict>
+  <key>StartInterval</key><integer>$INTERVAL_SECONDS</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>$STATE_DIR/launchd.out</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/launchd.err</string>
+</dict>
+</plist>
+PLISTEOF
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" && echo "Installed: runs every $((INTERVAL_SECONDS / 60)) min (idle >= ${IDLE_HOURS}h, snooze ${SNOOZE_HOURS}h). Log: $LOG_FILE"
+    exit $?
+    ;;
+  --uninstall)
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+    rm -f "$PLIST" && echo "Removed $LABEL."
+    exit $?
+    ;;
+esac
+
+if ! ps -o pid= -p $$ >/dev/null 2>&1; then
+  echo "ps is not permitted here (running inside a sandbox?). Run this from a normal terminal." >&2
+  exit 1
+fi
+
+case "$mode" in
+  --close)
+    # Close one session by PID right now, whatever its idle time, and write its recap to its terminal.
+    pid="${2:-}"
+    f="$SESSIONS_DIR/$pid.json"
+    if ! is_count "$pid" || [ ! -e "$f" ]; then echo "Usage: claude-cleanup --close <PID> (no session file for '$pid')" >&2; exit 1; fi
+    IFS=$'\t' read -r status updated procstart sid name cwd < <(
+      jq -r '[(.status // "-"), (.statusUpdatedAt // "-"), (.procStart // "-"), (.sessionId // "-"), (.name // "-"), (.cwd // "-")]
+             | map(tostring | if . == "" then "-" else . end) | @tsv' "$f")
+    if [ "$status" != "idle" ]; then echo "Session $pid is '$status', not idle. Not closing it." >&2; exit 1; fi
+    verify_pid "$pid" "$procstart" || { echo "PID $pid is not that Claude session any more. ${VERIFY_REASON}" >&2; exit 1; }
+    idle=0
+    is_count "$updated" && idle=$(( ($(date +%s) * 1000 - updated) / 3600000 ))
+    rss=$(( $(ps -o rss= -p "$pid" 2>/dev/null || echo 0) / 1024 ))
+    IFS=$'\t' read -r title recap < <(session_meta "$sid" "$name")
+    echo "Closing $pid ($(host_app "$pid")): $title"
+    close_session "$pid" "$procstart" "$idle" "$rss" "$sid" "$cwd" "$title" "$recap"
+    tail -1 "$LOG_FILE"
+    ;;
+
+  --list|--dry-run)
+    rows=$(find_candidates no)
+    if [ -z "$rows" ]; then
+      echo "No sessions idle for ${IDLE_HOURS}h or more."
+    else
+      total=0; count=0
+      echo "Would offer to close (idle >= ${IDLE_HOURS}h):"
+      while IFS=$'\t' read -r pid idle rss version key procstart sid cwd title recap app; do
+        printf '  %6s  %8s  %5s MB  %-10s \033[1m%s\033[0m  \033[2m%s\033[0m\n' "$pid" "$(idle_text "$idle")" "$rss" "$app" "$title" "${cwd/#$HOME/~}"
+        [ "$recap" != "-" ] && printf '                              \033[2m%s\033[0m\n' "${recap:0:110}"
+        total=$((total + rss)); count=$((count + 1))
+      done <<< "$rows"
+      echo "$count sessions, roughly $total MB resident."
+    fi
+    summary
+    ;;
+
+  --json)
+    # Current candidates as picker JSON (used by the picker to refresh itself).
+    find_candidates yes | rows_to_json "${2:-false}"
+    ;;
+
+  --test|--run)
+    rows=$(find_candidates yes)
+    if [ -z "$rows" ]; then
+      [ "$mode" = --test ] && echo "Nothing to ask about (no idle sessions, or all snoozed)."
+      exit 0
+    fi
+    [ "$mode" = --test ] && test=true || test=false
+    picked=$(pick "$rows" "$test"); rc=$?
+    if [ "$rc" -gt 1 ]; then
+      log "picker failed (exit $rc), nothing closed or snoozed"
+      echo "Picker failed (exit $rc)." >&2
+      exit 1
+    fi
+
+    # The window may have been open for a long time: act on the sessions that are
+    # idle right now, not on the list from when it opened. A picked session that
+    # is no longer idle is simply not in this list, so it is left alone.
+    rows=$(find_candidates yes)
+    while IFS=$'\t' read -r pid idle rss version key procstart sid cwd title recap app; do
+      [ -n "$pid" ] || continue
+      if printf '%s\n' "$picked" | grep -qx "$pid"; then
+        if [ "$mode" = --test ]; then
+          echo "would close  $pid  $title"
+          farewell "$idle" "$sid" "$title" "$recap" | sed 's/^/    /'
+        else
+          close_session "$pid" "$procstart" "$idle" "$rss" "$sid" "$cwd" "$title" "$recap" &
+        fi
+      else
+        if [ "$mode" = --test ]; then
+          echo "would snooze $pid  $title  (${SNOOZE_HOURS}h)"
+        else
+          snooze "$key"; log "snoozed $pid \"$title\" for ${SNOOZE_HOURS}h"
+        fi
+      fi
+    done <<< "$rows"
+    wait
+    ;;
+
+  *)
+    sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac
