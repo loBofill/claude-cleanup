@@ -1,8 +1,8 @@
 #!/bin/bash
 # claude-cleanup: find Claude Code sessions that have sat idle for a long time
 # and offer to close them. Conversations are saved to disk, so `claude --resume`
-# brings any of them back. When a session is closed, its title, its last recap
-# and the resume command are written to the terminal it was running in.
+# brings any of them back. When a session is closed, its title and its last
+# recap are written to the terminal it was running in.
 #
 # Usage:
 #   claude-cleanup              list candidates, change nothing (dry run)
